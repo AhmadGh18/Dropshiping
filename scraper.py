@@ -23,6 +23,7 @@ Outputs:
 import asyncio
 import csv
 import json
+import math
 import re
 import sys
 from datetime import datetime
@@ -34,15 +35,55 @@ from playwright.async_api import async_playwright
 OUT_DIR = Path("results")
 OUT_DIR.mkdir(exist_ok=True)
 
+# List of (keyword, score) — higher score = stronger purchase signal.
+# Score tiers: 4 = explicit commercial, 2 = moderate, 1 = weak/contextual
 PRODUCT_KEYWORDS = [
-    "link in bio", "shop now", "buy now", "available at", "use code",
-    "discount", "promo", "amazon", "shopify", "shop my", "tiktokshop",
-    "tiktok shop", "tiktokmademebuyit", "tiktok made me buy",
+    # 4-point: explicit purchase / commercial intent
+    ("buy now", 4), ("shop now", 4), ("order now", 4), ("get yours", 4),
+    ("add to cart", 4), ("use code", 4), ("discount code", 4),
+    ("promo code", 4), ("coupon code", 4), ("link in bio", 4),
+    ("shop link", 4), ("check link", 4), ("in my bio", 4), ("bio link", 4),
+    ("tiktok shop", 4), ("tiktokshop", 4), ("tiktokmademebuyit", 4),
+    ("amazon find", 4), ("available on amazon", 4), ("found on amazon", 4),
+    ("it's on amazon", 4), ("its on amazon", 4),
+    ("paid partnership", 4), ("gifted", 4), ("sponsored", 4),
+    # 2-point: moderate commercial signals
+    ("shop my", 2), ("shop the", 2), ("available at", 2),
+    ("swipe up", 2), ("check my bio", 2), ("save this", 2),
+    ("on sale", 2), ("free shipping", 2), ("limited time", 2),
+    ("collab", 2), ("ambassador", 2), ("affiliate", 2),
+    ("amazon", 2), ("shopify", 2),
+    # 1-point: weak / contextual signals
+    ("discount", 1), ("promo", 1), ("sale", 1), ("haul", 1),
+    ("unboxing", 1), ("review", 1), ("must have", 1), ("must-have", 1),
+    ("game changer", 1), ("obsessed", 1), ("affordable", 1),
 ]
+
+# Dict of hashtag → score (4 = strong commercial, 2 = moderate, 1 = weak)
 PRODUCT_HASHTAGS = {
-    "tiktokmademebuyit", "tiktokshop", "amazonfinds", "amazonmusthaves",
-    "musthaves", "founditonamazon", "productreview", "ad", "sponsored",
+    "tiktokmademebuyit": 4, "tiktokshop": 4, "amazonfinds": 4,
+    "amazonmusthaves": 4, "founditonamazon": 4, "ad": 4, "sponsored": 4,
+    "paidpartnership": 4, "gifted": 4,
+    "productreview": 2, "musthaves": 2, "shophaul": 2, "unboxing": 2,
+    "shoppinghaul": 2, "affordablefinds": 2, "targetfinds": 2,
+    "shopwithme": 2, "amazondeal": 2, "amazondeals": 2,
+    "haul": 1, "review": 1, "ootd": 1,
 }
+
+# Specific-enough keywords to be meaningful as cluster keys (exclude generic CTAs)
+CLUSTER_KEYWORDS = {
+    kw for kw, pts in PRODUCT_KEYWORDS
+    if pts >= 4 and kw not in {
+        "link in bio", "in my bio", "bio link", "check link", "shop link",
+        "shop now", "buy now", "order now", "add to cart",
+        "gifted", "sponsored", "paid partnership",
+    }
+}
+
+# Shop link domains used for product detection and clustering
+SHOP_DOMAINS = ["amazon.", "shopify", "shopee", "tiktok.com/t/",
+                 "linktr.ee", "beacons.ai", "stan.store", "allmylinks.com"]
+
 URL_RE = re.compile(r"https?://[^\s)]+", re.I)
 HASHTAG_RE = re.compile(r"#(\w+)", re.U)
 
@@ -73,41 +114,64 @@ DAYS_FILTER = int(pop_flag_value("--days", "30"))
 COMMENTS_TOP = int(pop_flag_value("--comments-top", "15"))
 
 
+# (phrase, weight) — higher weight = stronger buyer intent signal
 BUY_INTENT_PHRASES = [
-    "link?", "link please", "drop the link", "drop a link", "where did you get",
-    "where can i", "where to buy", "where to get", "what's it called",
-    "what is this called", "what is this", "i need this", "i need it",
-    "i want this", "i want it", "i'm buying", "im buying", "ordered",
-    "just ordered", "bought it", "got it", "obsessed", "name?", "brand?",
-    "what brand", "what's the brand", "code?", "discount code", "@ me",
-    "tag me", "send link", "drop name",
+    # 3-point: explicit purchase readiness
+    ("where to buy", 3), ("where can i buy", 3), ("how do i buy", 3),
+    ("drop the link", 3), ("send link", 3), ("link please", 3),
+    ("just ordered", 3), ("already ordered", 3), ("i need this in my life", 3),
+    ("need the link", 3), ("need a link", 3),
+    # 2-point: strong curiosity / purchase intent
+    ("link?", 2), ("drop a link", 2), ("where did you get", 2),
+    ("where can i", 2), ("where to get", 2), ("what's it called", 2),
+    ("what is this called", 2), ("i need this", 2), ("i need it", 2),
+    ("i'm buying", 2), ("im buying", 2), ("bought it", 2),
+    ("name?", 2), ("brand?", 2), ("what brand", 2), ("code?", 2),
+    ("discount code", 2), ("drop name", 2), ("@ me", 2), ("tag me", 2),
+    # 1-point: soft intent / social proof
+    ("i want this", 1), ("i want it", 1), ("ordered", 1),
+    ("got it", 1), ("obsessed", 1), ("what's the brand", 1),
+    ("send me", 1), ("what is this", 1), ("what's this", 1),
 ]
 
 
 def detect_product(caption, hashtags, links):
     cap = (caption or "").lower()
     score, matched = 0, []
-    for kw in PRODUCT_KEYWORDS:
+    for kw, pts in PRODUCT_KEYWORDS:
         if kw in cap:
-            score += 2
+            score += pts
             matched.append(kw)
     for tag in hashtags:
-        if tag.lower() in PRODUCT_HASHTAGS:
-            score += 2
+        pts = PRODUCT_HASHTAGS.get(tag.lower(), 0)
+        if pts:
+            score += pts
             matched.append("#" + tag)
     for link in links:
         host = urlparse(link).netloc.lower()
-        if any(s in host for s in ["amazon.", "shopify", "shopee", "tiktok.com/t/", "linktr.ee", "beacons.ai"]):
-            score += 3
+        if any(s in host for s in SHOP_DOMAINS):
+            score += 5
             matched.append(host)
-    return score, matched
+    # bonus when 2+ independent signal types agree (cross-validation)
+    signal_types = sum([
+        any(kw in cap for kw, pts in PRODUCT_KEYWORDS if pts >= 4),
+        any(PRODUCT_HASHTAGS.get(t.lower(), 0) >= 3 for t in hashtags),
+        bool(links),
+    ])
+    if signal_types >= 2:
+        score += 3
+    return min(score, 30), matched  # cap to prevent runaway accumulation
 
 
-def viral_score(views, likes, comments, shares):
+def viral_score(views, likes, comments, shares, saves=0):
     if views <= 0:
         return 0.0
-    engagement = (likes + comments * 2 + shares * 3) / max(views, 1)
-    return round(engagement * 100 + (views / 100_000), 2)
+    # saves are the strongest signal (people bookmark to buy later)
+    engagement = (likes + comments * 2 + shares * 3 + saves * 4) / max(views, 1)
+    # log-scale view contribution so a 10M-view video doesn't drown a
+    # 500k-view high-engagement video — log10(10M)=7, normalises to ~1.43
+    view_component = math.log10(max(views, 1)) / 7.0
+    return round(engagement * 100 + view_component * 10, 2)
 
 
 def days_since(epoch_seconds):
@@ -142,6 +206,7 @@ def item_to_row(item, source_url=""):
     likes = stats.get("diggCount", 0)
     comments = stats.get("commentCount", 0)
     shares = stats.get("shareCount", 0)
+    saves = stats.get("collectCount", 0) or stats.get("saveCount", 0)
     create_time = item.get("createTime", "")
     age = days_since(create_time)
     return {
@@ -157,6 +222,7 @@ def item_to_row(item, source_url=""):
         "likes": likes,
         "comments": comments,
         "shares": shares,
+        "saves": saves,
         "velocity_views_per_day": velocity(views, age) if age else 0.0,
         "duration": (item.get("video") or {}).get("duration", 0),
         "music": (item.get("music") or {}).get("title", ""),
@@ -164,7 +230,7 @@ def item_to_row(item, source_url=""):
         "links": ",".join(links),
         "product_score": p_score,
         "product_signals": ",".join(p_match),
-        "viral_score": viral_score(views, likes, comments, shares),
+        "viral_score": viral_score(views, likes, comments, shares, saves),
         "comment_intent_score": 0,
         "comment_intent_samples": "",
     }
@@ -318,18 +384,22 @@ async def scrape_comments_for_video(page, url, max_comments=50):
 
 
 def score_comments(comments):
+    """Score comment list for buy intent. Each comment contributes at most the
+    weight of its highest-matching phrase (no double-counting per comment)."""
     if not comments:
         return 0, []
     score = 0
     samples = []
     for c in comments:
         cl = c.lower()
-        for phrase in BUY_INTENT_PHRASES:
+        best_weight = 0
+        for phrase, weight in BUY_INTENT_PHRASES:
             if phrase in cl:
-                score += 1
-                if len(samples) < 5:
-                    samples.append(c[:120])
-                break
+                best_weight = max(best_weight, weight)
+        if best_weight:
+            score += best_weight
+            if len(samples) < 5:
+                samples.append(c[:120])
     return score, samples
 
 
@@ -458,12 +528,22 @@ def save(results, mode, target):
     print(f"[OK] Saved {len(results)} rows -> {base}.json / .csv")
 
 
-def filter_viral_products(results, min_views=50_000, min_product_score=2, max_age_days=0):
+def filter_viral_products(results, min_views=30_000, min_product_score=4,
+                          max_age_days=0, min_velocity=800):
+    """Keep videos that are both product-relevant and demonstrably viral.
+
+    A video passes if it has a strong product signal AND either:
+      - enough raw views (established viral), OR
+      - high views/day velocity (early viral that hasn't peaked yet).
+    """
     out = []
     for r in results:
-        if r.get("views", 0) < min_views:
-            continue
         if r.get("product_score", 0) < min_product_score:
+            continue
+        views = r.get("views", 0)
+        vel = r.get("velocity_views_per_day", 0)
+        # pass if high absolute views OR fast-growing (catch early viral)
+        if views < min_views and vel < min_velocity:
             continue
         if max_age_days > 0:
             age = r.get("age_days", "")
@@ -485,7 +565,9 @@ def canonicalize_link(link):
 
 
 def cluster_signals(rows):
-    """Group videos by shared product signal. A signal = product hashtag, shop link, or product keyword."""
+    """Group videos by shared product signal. A signal = specific product hashtag,
+    shop link, or high-specificity keyword.  Generic CTAs like 'link in bio' are
+    excluded as cluster keys — they would mix unrelated products together."""
     clusters = {}
 
     def add(key, row):
@@ -493,6 +575,7 @@ def cluster_signals(rows):
             "signal": key, "videos": [], "creators": set(),
             "total_views": 0, "total_likes": 0, "total_comments": 0,
             "total_shares": 0, "total_intent": 0,
+            "total_velocity": 0.0, "total_product_score": 0,
         })
         c["videos"].append(row)
         c["creators"].add(row.get("author_username", ""))
@@ -501,34 +584,49 @@ def cluster_signals(rows):
         c["total_comments"] += row.get("comments", 0)
         c["total_shares"] += row.get("shares", 0)
         c["total_intent"] += row.get("comment_intent_score", 0)
+        c["total_velocity"] += row.get("velocity_views_per_day", 0)
+        c["total_product_score"] += row.get("product_score", 0)
 
     for r in rows:
+        # only cluster on hashtags with score >= 3 (strong commercial signal)
         for tag in (r.get("hashtags", "") or "").split(","):
             t = tag.strip().lower()
-            if t and t in PRODUCT_HASHTAGS:
+            if t and PRODUCT_HASHTAGS.get(t, 0) >= 3:
                 add(f"#{t}", r)
+        # cluster on shop links (most specific product identifier)
         for link in (r.get("links", "") or "").split(","):
             link = link.strip()
             if not link:
                 continue
             host = urlparse(link).netloc.lower()
-            if any(s in host for s in ["amazon.", "shopify", "shopee", "tiktok.com/t/", "linktr.ee", "beacons.ai"]):
+            if any(s in host for s in SHOP_DOMAINS):
                 add(canonicalize_link(link), r)
+        # cluster only on specific high-value keywords, not generic CTAs
         cap = (r.get("caption", "") or "").lower()
-        for kw in PRODUCT_KEYWORDS:
-            if kw in cap and kw not in ("amazon", "shopify"):
+        for kw, pts in PRODUCT_KEYWORDS:
+            if pts >= 4 and kw in cap and kw in CLUSTER_KEYWORDS:
                 add(f"kw:{kw}", r)
 
     out = []
     for key, c in clusters.items():
         n_creators = len({u for u in c["creators"] if u})
-        if n_creators < 2:
-            continue
         n_videos = len(c["videos"])
+        # require at least 2 different creators AND 2 videos for a real trend
+        if n_creators < 2 or n_videos < 2:
+            continue
+        avg_velocity = c["total_velocity"] / n_videos
+        total_engagement = (c["total_likes"] + c["total_comments"] * 2
+                            + c["total_shares"] * 3)
+        avg_engagement_pct = total_engagement / max(c["total_views"], 1) * 100
+        avg_product_score = c["total_product_score"] / n_videos
         win_score = round(
-            n_creators * 10
-            + (c["total_views"] / 100_000)
-            + c["total_intent"] * 5,
+            n_creators * 15              # creator diversity = most reliable trend signal
+            + n_videos * 3               # video volume (more creators making it = real)
+            + (c["total_views"] / 50_000)  # total reach
+            + avg_velocity * 0.05        # currently trending (views/day)
+            + avg_engagement_pct * 2     # quality engagement (not just passive views)
+            + avg_product_score * 2      # strength of product signals
+            + c["total_intent"] * 8,     # buyers asking where-to-buy in comments
             2,
         )
         out.append({
@@ -539,10 +637,15 @@ def cluster_signals(rows):
             "total_likes": c["total_likes"],
             "total_comments": c["total_comments"],
             "total_shares": c["total_shares"],
+            "avg_velocity_per_day": round(avg_velocity, 1),
+            "avg_engagement_pct": round(avg_engagement_pct, 3),
+            "avg_product_score": round(avg_product_score, 1),
             "comment_intent_total": c["total_intent"],
             "win_score": win_score,
             "example_video_urls": " | ".join(v.get("url", "") for v in c["videos"][:3]),
-            "example_captions": " || ".join((v.get("caption", "") or "")[:100] for v in c["videos"][:3]),
+            "example_captions": " || ".join(
+                (v.get("caption", "") or "")[:100] for v in c["videos"][:3]
+            ),
         })
     out.sort(key=lambda x: x["win_score"], reverse=True)
     return out
@@ -564,8 +667,10 @@ def save_winners(clusters, target):
     print(f"[OK] Saved {len(clusters)} winning-product clusters -> {path}")
     print("\nTop candidates:")
     for c in clusters[:5]:
-        print(f"  {c['win_score']:>8.1f}  {c['signal']:<40}  {c['unique_creators']} creators, "
-              f"{c['total_views']:,} views, intent={c['comment_intent_total']}")
+        print(f"  {c['win_score']:>8.1f}  {c['signal']:<40}  "
+              f"{c['unique_creators']} creators, {c['total_views']:,} views, "
+              f"vel={c['avg_velocity_per_day']}/day, eng={c['avg_engagement_pct']}%, "
+              f"intent={c['comment_intent_total']}")
 
 
 async def enrich_with_comments(rows, top_n):
@@ -622,15 +727,15 @@ async def main():
         results = filter_viral_products(all_results, max_age_days=DAYS_FILTER)
         results.sort(
             key=lambda r: (
-                r.get("product_score", 0),
-                r.get("velocity_views_per_day", 0),
-                r.get("viral_score", 0),
+                r.get("product_score", 0) * 3
+                + r.get("velocity_views_per_day", 0) / 500
+                + r.get("viral_score", 0)
             ),
             reverse=True,
         )
         print(f"[+] {len(results)} viral product videos out of {len(all_results)} "
-              f"(filter: views>=50k, product>=2, age<={DAYS_FILTER}d)" if DAYS_FILTER else
-              f"[+] {len(results)} viral product videos out of {len(all_results)}")
+              f"(filter: product>={4}, views>={30_000} OR velocity>={800}/day"
+              + (f", age<={DAYS_FILTER}d)" if DAYS_FILTER else ")"))
 
         if SCRAPE_COMMENTS:
             await enrich_with_comments(results, COMMENTS_TOP)
