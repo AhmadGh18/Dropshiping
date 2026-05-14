@@ -233,6 +233,7 @@ def item_to_row(item, source_url=""):
         "viral_score": viral_score(views, likes, comments, shares, saves),
         "comment_intent_score": 0,
         "comment_intent_samples": "",
+        "comments_raw": "",
     }
 
 
@@ -692,6 +693,7 @@ async def enrich_with_comments(rows, top_n):
                     score, samples = score_comments(comments)
                     r["comment_intent_score"] = score
                     r["comment_intent_samples"] = " || ".join(samples)
+                    r["comments_raw"] = " ||| ".join(comments)
                     print(f"  ({i}/{len(targets)}) intent={score} | {len(comments)} comments | {url}")
                 except Exception as e:
                     print(f"  ({i}/{len(targets)}) failed: {e}")
