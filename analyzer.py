@@ -131,7 +131,7 @@ CATEGORIES = {
 }
 
 # Anchored price detection: require a price-context anchor word before the $X.
-# Bare "$5 off" → caught by DISCOUNT_RE first and excluded.
+# Bare "$5 off" -> caught by DISCOUNT_RE first and excluded.
 DISCOUNT_RE = re.compile(r"\$\s?(\d{1,4})\s*(?:off|discount|coupon)", re.I)
 PRICE_ANCHORED_RE = re.compile(
     r"(?:for|only|just|is|=|@|costs?|priced at|retails (?:for|at))"
@@ -147,6 +147,59 @@ CHEAP_HINTS = ["dupe", "affordable", "budget", "broke girl", "deal", "under $", 
 
 HARD_TO_SHIP = {"apparel"}
 BEST_MARGIN = {"beauty", "gadget", "kitchen", "home"}
+
+# ---------------------------------------------------------------------------
+# Logistics rules - keyword penalties / bonuses applied to the cluster's text.
+# Each entry is (compiled regex, points, reason). Points sum into sellability.
+# ---------------------------------------------------------------------------
+
+LOGISTICS_PENALTIES = [
+    (re.compile(r"\b(king|queen|weighted|oversized|huge|giant|jumbo)\b", re.I),
+     -5, "bulky -> high shipping cost"),
+    (re.compile(r"\b(glass|ceramic|mirror|porcelain|crystal)\b", re.I),
+     -4, "fragile -> breakage / returns"),
+    (re.compile(r"\b(battery|rechargeable|lithium|powerbank|power\s+bank)\b", re.I),
+     -3, "lithium -> shipping restrictions"),
+    (re.compile(r"\b(perfume|fragrance|cologne|aerosol|hairspray|hair\s+spray)\b", re.I),
+     -4, "flammable -> hazmat fees"),
+    (re.compile(r"\b(supplement|vitamin|cbd|melatonin|gummy|tincture|probiotic)\b", re.I),
+     -8, "ingestible -> FDA / platform restrictions"),
+    (re.compile(
+        r"\b(pokemon|disney|marvel|nike|adidas|stanley\b|apple\b|sanrio|lego|"
+        r"harry\s+potter|nintendo|sony|samsung|gucci|prada|chanel|hermes)\b", re.I),
+     -10, "trademarked brand -> listing removal / lawsuit risk"),
+    (re.compile(r"\b(baby|toddler|infant|crib|car\s+seat|pacifier)\b", re.I),
+     -5, "children's product -> CPSC safety compliance required"),
+    (re.compile(r"\b(laser|knife|sword|airsoft|taser|firearm|weapon)\b", re.I),
+     -8, "weapon-adjacent -> platform restrictions"),
+    (re.compile(r"\b(size\s+[xsml]+|fits\s+sizes|true\s+to\s+size|"
+                r"runs\s+small|runs\s+large|wear\s+a\s+size)\b", re.I),
+     -3, "sized apparel -> high return rate from fit"),
+]
+
+LOGISTICS_BONUSES = [
+    (re.compile(r"\b(refill|refillable|cartridge|consumable|monthly|subscription)\b", re.I),
+     +5, "consumable -> repeat customers"),
+    (re.compile(r"\b(travel|portable|compact|mini|pocket|foldable)\b", re.I),
+     +3, "compact -> cheap shipping"),
+    (re.compile(r"\b(silicone|nylon|aluminum|stainless)\b", re.I),
+     +1, "durable material -> low returns"),
+    (re.compile(r"\b(unisex|one\s+size|adjustable)\b", re.I),
+     +2, "no sizing returns"),
+]
+
+# Rough industry-typical retail margins by category (post-COGS, pre-ad-spend)
+BASE_MARGIN = {
+    "beauty": 0.65, "gadget": 0.55, "home": 0.55, "kitchen": 0.50,
+    "pet": 0.55, "fitness": 0.45, "apparel": 0.40, "uncategorized": 0.40,
+}
+# Price tier acts as a margin multiplier - the $15-50 sweet spot is best
+PRICE_MARGIN_ADJ = {
+    "under_15": 1.00, "15_50": 1.15, "50_100": 1.00,
+    "100_plus": 0.80, "unknown": 0.95,
+}
+# Below this, ad spend kills the business
+MIN_VIABLE_MARGIN = 0.25
 
 # Word-boundary ad detection (does NOT match #advertisement)
 AD_RE = re.compile(
@@ -599,6 +652,42 @@ def saturation(n_creators):
     return "early"
 
 
+def logistics_check(text):
+    """Scan the cluster's combined text for shipping/legal/business red and
+    green flags. Returns (total_pts, penalty_reasons, bonus_reasons).
+    Each rule is applied at most once even if multiple matches."""
+    pts = 0
+    penalty_reasons, bonus_reasons = [], []
+    for rx, p, reason in LOGISTICS_PENALTIES:
+        if rx.search(text):
+            pts += p
+            penalty_reasons.append(f"{p:+d} {reason}")
+    for rx, b, reason in LOGISTICS_BONUSES:
+        if rx.search(text):
+            pts += b
+            bonus_reasons.append(f"{b:+d} {reason}")
+    return pts, penalty_reasons, bonus_reasons
+
+
+def estimate_margin(category, price_tier, logistics_pts):
+    """Estimate net retail margin (0-1). Combines category baseline, price-tier
+    multiplier, and logistics adjustment (each -1 logistics pt ~= -1% margin)."""
+    base = BASE_MARGIN.get(category, 0.40)
+    adj  = PRICE_MARGIN_ADJ.get(price_tier, 0.95)
+    logistics_delta = max(-0.20, min(0.10, logistics_pts * 0.01))
+    margin = base * adj + logistics_delta
+    return max(0.05, min(0.75, margin))
+
+
+def margin_confidence(category, price_tier):
+    """How much trust to put in the margin estimate."""
+    if category == "uncategorized" and price_tier == "unknown":
+        return "low"
+    if category != "uncategorized" and price_tier != "unknown":
+        return "high"
+    return "medium"
+
+
 def score_cluster(cluster):
     """Return scoring dict with score, verdict, reasons, concerns."""
     videos = cluster["videos"]
@@ -629,6 +718,11 @@ def score_cluster(cluster):
 
     tier = cluster.get("tier", "tag")
     cross_validated = cluster.get("cross_validated", False)
+
+    # Logistics scan + margin estimate
+    logistics_pts, logistics_penalties, logistics_bonuses = logistics_check(cluster_text)
+    est_margin = estimate_margin(category, price_tier, logistics_pts)
+    margin_conf = margin_confidence(category, price_tier)
 
     # ----- Score components (0-100) -----
     if 5 <= n_creators <= 15:
@@ -668,7 +762,9 @@ def score_cluster(cluster):
     sellability_pts += {"link": 5, "entity": 3, "tag": 0}.get(tier, 0)
     if cross_validated:
         sellability_pts += 3
-    sellability_pts = max(-10, min(15, sellability_pts))
+    # Logistics flags (trademarks, fragile, hazmat, consumables, etc.)
+    sellability_pts += logistics_pts
+    sellability_pts = max(-15, min(20, sellability_pts))
 
     raw_score = creator_pts + eng_pts + demand_pts + freshness_pts + sellability_pts
     final_score = max(0, min(100, round(raw_score, 1)))
@@ -692,6 +788,21 @@ def score_cluster(cluster):
         verdict = "WATCH"
     else:
         verdict = "SKIP"
+
+    # Margin gate: a product with thin margins can't survive ad spend.
+    # Only apply when we have enough signal for a reliable margin estimate.
+    if margin_conf != "low" and not overrides:
+        if verdict == "STRONG SELL" and est_margin < 0.45:
+            verdict = "SELL"
+            overrides.append(
+                f"margin only {est_margin:.0%} - too thin for STRONG SELL"
+            )
+        elif verdict in ("SELL", "WATCH") and est_margin < MIN_VIABLE_MARGIN:
+            verdict = "SKIP"
+            overrides.append(
+                f"margin {est_margin:.0%} below {MIN_VIABLE_MARGIN:.0%} viability"
+                " - ads will eat the profit"
+            )
 
     # ----- Reasoning -----
     reasons, concerns = [], []
@@ -721,6 +832,10 @@ def score_cluster(cluster):
         reasons.append(f"category '{category}' has good margins and is easy to ship")
     if price_tier in ("under_15", "15_50") and price_evidence:
         reasons.append(f"price point {price_evidence} is in the dropship sweet spot")
+    if margin_conf in ("high", "medium") and est_margin >= 0.50:
+        reasons.append(f"estimated margin {est_margin:.0%} - healthy ad-spend headroom")
+    for br in logistics_bonuses[:3]:
+        reasons.append(br)
 
     if tier == "tag":
         concerns.append("clustered only on hashtag - product identity not confirmed (could be mixed products)")
@@ -746,6 +861,16 @@ def score_cluster(cluster):
         concerns.append(f"category '{category}' has high return/sizing issues - harder to ship profitably")
     if price_tier == "100_plus":
         concerns.append(f"price point {price_evidence or 'premium'} = lower volume, harder margin")
+    if margin_conf in ("high", "medium") and est_margin < MIN_VIABLE_MARGIN:
+        concerns.append(
+            f"estimated margin {est_margin:.0%} below {MIN_VIABLE_MARGIN:.0%} - "
+            "ad-spend will eat profit"
+        )
+    for pr in logistics_penalties[:4]:
+        concerns.append(pr)
+
+    # Trademark risk is the single most severe flag - call it out explicitly
+    has_trademark_risk = any("trademark" in r for r in logistics_penalties)
 
     return {
         "score": final_score,
@@ -777,6 +902,11 @@ def score_cluster(cluster):
         "paid_video_count": paid_count,
         "micro_organic_count": micro_organic,
         "low_engagement_count": low_eng_count,
+        "estimated_margin_pct": round(est_margin * 100, 1),
+        "margin_confidence": margin_conf,
+        "logistics_pts": logistics_pts,
+        "logistics_flags": " | ".join(logistics_penalties + logistics_bonuses),
+        "trademark_risk": has_trademark_risk,
     }
 
 
@@ -790,6 +920,8 @@ def write_verdicts_csv(scored_clusters, path):
     base_keys = [
         "signal", "tier", "cross_validated", "verdict", "score",
         "category", "price_tier", "price_evidence",
+        "estimated_margin_pct", "margin_confidence",
+        "logistics_pts", "trademark_risk", "logistics_flags",
         "saturation", "trajectory", "n_creators", "n_videos",
         "total_views", "total_likes", "total_shares", "total_saves",
         "total_buy_intent", "total_positive_sentiment", "total_negative_sentiment",
@@ -853,11 +985,15 @@ def write_report_md(scored_clusters, path, target):
             cv_badge = " · ✓cross-validated" if c.get("cross_validated") else ""
             lines.append(f"### {c['signal']} — score {c['score']} ({tier_badge}{cv_badge})")
             lines.append("")
+            tm = " · ⚠ trademark risk" if c.get("trademark_risk") else ""
             lines.append(
                 f"`{c['category']}` · price `{c['price_tier']}` "
-                f"{c['price_evidence']} · {c['n_creators']} creators · "
+                f"{c['price_evidence']} · margin "
+                f"~{c.get('estimated_margin_pct', 0)}% "
+                f"({c.get('margin_confidence', '?')}) · "
+                f"{c['n_creators']} creators · "
                 f"{c['n_videos']} videos · {c['total_views']:,} views · "
-                f"`{c['saturation']}` · `{c['trajectory']}`"
+                f"`{c['saturation']}` · `{c['trajectory']}`{tm}"
             )
             lines.append("")
             if c.get("overrides"):
@@ -959,8 +1095,10 @@ def main():
     print("\nTop 5 candidates:")
     for c in scored[:5]:
         cv = "✓" if c["cross_validated"] else " "
-        print(f"  [{c['verdict']:<12}] {c['score']:>5.1f} {cv} {c['tier']:<6} "
-              f"{c['signal']:<35} {c['category']:<14} "
+        tm = " ⚠TM" if c.get("trademark_risk") else "    "
+        margin = c.get("estimated_margin_pct", 0)
+        print(f"  [{c['verdict']:<12}] {c['score']:>5.1f} {cv}{tm} {c['tier']:<6} "
+              f"m{margin:>4.0f}% {c['signal']:<30} {c['category']:<12} "
               f"{c['n_creators']}c/{c['n_videos']}v "
               f"{c['saturation']}/{c['trajectory']}")
 
