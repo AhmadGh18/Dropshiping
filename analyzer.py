@@ -33,6 +33,8 @@ try:
 except ImportError:
     WORDNINJA_OK = False
 
+import storage
+
 OUT_DIR = Path("results")
 
 
@@ -911,6 +913,82 @@ def score_cluster(cluster):
 
 
 # ---------------------------------------------------------------------------
+# Momentum adjustment - applied after base scoring, using prior snapshots
+# ---------------------------------------------------------------------------
+
+def _score_to_verdict(score):
+    """Pure score-to-verdict mapping, without overrides."""
+    if score >= 75:
+        return "STRONG SELL"
+    if score >= 55:
+        return "SELL"
+    if score >= 35:
+        return "WATCH"
+    return "SKIP"
+
+
+def apply_momentum(scored, momentum):
+    """Mutates `scored` in place. Adjusts score by the momentum multiplier,
+    recomputes the score-based portion of the verdict (overrides stick),
+    and adds momentum reasons/concerns.
+
+    The base score is preserved as `score_pre_momentum` for transparency.
+    """
+    stage = momentum.get("stage", "noisy")
+    pre = scored["score"]
+    scored["score_pre_momentum"] = pre
+    scored["momentum_stage"] = stage
+    scored["momentum_days_observed"] = momentum.get("days_observed", 0)
+    scored["momentum_days_since_last"] = momentum.get("days_since_last")
+    scored["momentum_n_prior_snapshots"] = momentum.get("n_prior_snapshots", 0)
+    scored["momentum_view_wow_pct"] = momentum.get("view_wow_pct")
+    scored["momentum_creator_wow_pct"] = momentum.get("creator_wow_pct")
+    scored["momentum_intent_wow_pct"] = momentum.get("intent_wow_pct")
+    scored["momentum_score_delta"] = momentum.get("score_delta")
+
+    mult = storage.MOMENTUM_MULTIPLIER.get(stage, 1.0)
+    adjusted = max(0, min(100, round(pre * mult, 1)))
+    scored["score"] = adjusted
+
+    # Verdict recomputation:
+    # - if base verdict came from an override (saturated/avoid/paid/margin), keep it
+    # - else recompute from the adjusted score
+    if not scored.get("overrides"):
+        scored["verdict"] = _score_to_verdict(adjusted)
+
+    # Momentum can override an otherwise-strong verdict
+    if stage == "declining" and scored["verdict"] in ("STRONG SELL", "SELL"):
+        scored["verdict"] = "WATCH"
+        v_wow = momentum.get("view_wow_pct")
+        scored["overrides"].append(
+            f"trend declining (views {v_wow}% WoW)" if v_wow is not None
+            else "trend declining"
+        )
+
+    # Surface momentum in reasons / concerns
+    if stage == "compounding":
+        v = momentum.get("view_wow_pct"); i = momentum.get("intent_wow_pct")
+        scored["reasons"].insert(0,
+            f"trend compounding: views {v}% WoW, intent {i}% WoW - confirmed organic growth")
+    elif stage == "early_acceleration":
+        v = momentum.get("view_wow_pct")
+        scored["reasons"].insert(0,
+            f"early acceleration phase (views {v}% WoW) - get in before saturation")
+    elif stage == "expanding":
+        scored["reasons"].append("slow steady growth across snapshots")
+    elif stage == "mature_steady":
+        scored["reasons"].append("mature/steady - possible evergreen product")
+    elif stage == "declining":
+        v = momentum.get("view_wow_pct")
+        scored["concerns"].insert(0,
+            f"trend declining (views {v}% WoW) - product past peak")
+    elif stage == "first_seen":
+        scored["concerns"].append("first observation - no history to confirm trend (run again in 3 days)")
+    elif stage == "noisy" and momentum.get("n_prior_snapshots", 0) >= 2:
+        scored["concerns"].append("inconclusive momentum - signals mixed")
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -918,7 +996,10 @@ def write_verdicts_csv(scored_clusters, path):
     if not scored_clusters:
         return
     base_keys = [
-        "signal", "tier", "cross_validated", "verdict", "score",
+        "signal", "tier", "cross_validated", "verdict", "score", "score_pre_momentum",
+        "momentum_stage", "momentum_days_observed", "momentum_n_prior_snapshots",
+        "momentum_view_wow_pct", "momentum_creator_wow_pct", "momentum_intent_wow_pct",
+        "momentum_score_delta",
         "category", "price_tier", "price_evidence",
         "estimated_margin_pct", "margin_confidence",
         "logistics_pts", "trademark_risk", "logistics_flags",
@@ -995,6 +1076,27 @@ def write_report_md(scored_clusters, path, target):
                 f"{c['n_videos']} videos · {c['total_views']:,} views · "
                 f"`{c['saturation']}` · `{c['trajectory']}`{tm}"
             )
+            mom_stage = c.get("momentum_stage")
+            if mom_stage and mom_stage != "first_seen":
+                mom_bits = [f"**Trend:** `{mom_stage}`"]
+                d = c.get("momentum_days_observed")
+                n = c.get("momentum_n_prior_snapshots")
+                if d:
+                    mom_bits.append(f"observed {d}d / {n} prior runs")
+                vw = c.get("momentum_view_wow_pct")
+                cw = c.get("momentum_creator_wow_pct")
+                iw = c.get("momentum_intent_wow_pct")
+                if vw is not None:
+                    mom_bits.append(f"views {vw:+.0f}%")
+                if cw is not None:
+                    mom_bits.append(f"creators {cw:+.0f}%")
+                if iw is not None:
+                    mom_bits.append(f"intent {iw:+.0f}%")
+                lines.append(" · ".join(mom_bits))
+                lines.append("")
+            elif mom_stage == "first_seen":
+                lines.append("**Trend:** `first_seen` (no history yet)")
+                lines.append("")
             lines.append("")
             if c.get("overrides"):
                 lines.append("**Override:** " + "; ".join(c["overrides"]))
@@ -1073,11 +1175,25 @@ def main():
         print("[!] No cross-creator clusters found (need >=2 creators sharing a signal).")
         return
 
+    # Open the history DB - momentum is looked up against PRIOR runs only;
+    # the current run is saved at the end so it doesn't bias its own lookup.
+    conn = storage.connect()
+    prior_runs = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+    print(f"[+] History DB: {prior_runs} prior snapshot(s) on file")
+
     scored = []
     for c in clusters:
         s = score_cluster(c)
         s["signal"] = c["signal"]
         s["example_urls"] = [v.get("url", "") for v in c["videos"][:3]]
+
+        # Match cluster signal against any historical product_key (fuzzy)
+        matched_key = storage.find_matched_product_key(s["signal"], conn)
+        s["historical_product_key"] = matched_key
+        # Compute momentum from prior snapshots
+        mom = storage.momentum_features(matched_key, conn)
+        apply_momentum(s, mom)
+
         scored.append(s)
     scored.sort(key=lambda x: x["score"], reverse=True)
 
@@ -1087,20 +1203,38 @@ def main():
     write_report_md(scored, report_path, target)
     print(f"[OK] Cluster verdicts -> {verdicts_path}")
     print(f"[OK] Human report   -> {report_path}")
+
     by_tier = {}
+    by_stage = {}
     for c in scored:
         by_tier[c["tier"]] = by_tier.get(c["tier"], 0) + 1
+        st = c.get("momentum_stage", "noisy")
+        by_stage[st] = by_stage.get(st, 0) + 1
     tier_summary = ", ".join(f"{n} {t}" for t, n in by_tier.items())
     print(f"[+] {len(scored)} clusters by tier: {tier_summary}")
+    if prior_runs:
+        stage_summary = ", ".join(f"{n} {s}" for s, n in by_stage.items())
+        print(f"[+] momentum stages: {stage_summary}")
+
     print("\nTop 5 candidates:")
     for c in scored[:5]:
         cv = "✓" if c["cross_validated"] else " "
         tm = " ⚠TM" if c.get("trademark_risk") else "    "
         margin = c.get("estimated_margin_pct", 0)
+        stage_abbr = {
+            "first_seen": "new ", "early_acceleration": "accel",
+            "compounding": "COMP", "expanding": "expnd",
+            "mature_steady": "matur", "declining": "DECL", "noisy": "noisy",
+        }.get(c.get("momentum_stage", "noisy"), "?    ")
         print(f"  [{c['verdict']:<12}] {c['score']:>5.1f} {cv}{tm} {c['tier']:<6} "
-              f"m{margin:>4.0f}% {c['signal']:<30} {c['category']:<12} "
-              f"{c['n_creators']}c/{c['n_videos']}v "
-              f"{c['saturation']}/{c['trajectory']}")
+              f"m{margin:>4.0f}% {stage_abbr:<5} {c['signal']:<28} "
+              f"{c['category']:<12} {c['n_creators']}c/{c['n_videos']}v")
+
+    # Save this run to history AFTER all momentum was computed against priors
+    sid = storage.save_snapshot(conn, target, "analyzer", enriched, scored)
+    print(f"[OK] Saved snapshot #{sid} to history.db ({len(enriched)} videos, "
+          f"{len(scored)} clusters)")
+    conn.close()
 
 
 if __name__ == "__main__":
