@@ -1,1 +1,6 @@
-playwright==1.48.0
+# Playwright pin relaxed so newer wheels work on Python 3.14
+playwright>=1.48
+# Used by analyzer.py for fuzzy entity merging ('stanley tumbler' ~= 'stanleys tumbler')
+rapidfuzz>=3.0
+# Used by analyzer.py to split concatenated hashtags ('stanleycup' -> 'stanley cup')
+wordninja>=2.0

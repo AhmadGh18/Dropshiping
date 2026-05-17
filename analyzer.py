@@ -15,9 +15,23 @@ import csv
 import json
 import re
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+
+# Optional dependencies - analyzer degrades gracefully if missing.
+try:
+    from rapidfuzz import fuzz
+    FUZZY_OK = True
+except ImportError:
+    FUZZY_OK = False
+
+try:
+    import wordninja
+    WORDNINJA_OK = True
+except ImportError:
+    WORDNINJA_OK = False
 
 OUT_DIR = Path("results")
 
@@ -73,14 +87,12 @@ SKEPTICAL_PHRASES = [
     ("does it actually work", 1),
 ]
 
-# Genuine specific questions = real buyer research, not just hype
 SPECIFIC_QUESTIONS = [
     "does it work on", "does it work for", "is it safe for",
     "how long does", "can you use it", "would this work",
     "does it come in", "what size", "does it ship",
 ]
 
-# Category lexicon - first match wins by total keyword hits in cluster text
 CATEGORIES = {
     "beauty": [
         "skincare", "serum", "makeup", "mascara", "foundation", "lipstick",
@@ -118,34 +130,86 @@ CATEGORIES = {
     ],
 }
 
-PRICE_RE = re.compile(r"\$\s?(\d{1,4})(?:\.\d{1,2})?")
+# Anchored price detection: require a price-context anchor word before the $X.
+# Bare "$5 off" → caught by DISCOUNT_RE first and excluded.
+DISCOUNT_RE = re.compile(r"\$\s?(\d{1,4})\s*(?:off|discount|coupon)", re.I)
+PRICE_ANCHORED_RE = re.compile(
+    r"(?:for|only|just|is|=|@|costs?|priced at|retails (?:for|at))"
+    r"\s*\$?\s*(\d{1,4})(?:\.\d{1,2})?",
+    re.I,
+)
+PRICE_PLAIN_RE = re.compile(r"\$\s?(\d{1,4})(?:\.\d{1,2})?")
 UNDER_RE = re.compile(r"under\s*\$?\s*(\d{1,4})", re.I)
-PRICE_WORD_RE = re.compile(r"(\d{1,4})\s*(?:dollars|bucks)", re.I)
+PRICE_WORD_RE = re.compile(r"(\d{1,4})\s*(?:dollars|bucks)\b", re.I)
 
 PREMIUM_HINTS = ["luxury", "designer", "high end", "high-end", "premium", "splurge"]
 CHEAP_HINTS = ["dupe", "affordable", "budget", "broke girl", "deal", "under $", "only $"]
 
-HARD_TO_SHIP = {"apparel"}            # size / fit / return issues
-BEST_MARGIN = {"beauty", "gadget", "kitchen", "home"}  # cheap to source, high markup
-RESTRICTED = {"supplement"}           # ingestible = legal/regulatory risk
+HARD_TO_SHIP = {"apparel"}
+BEST_MARGIN = {"beauty", "gadget", "kitchen", "home"}
 
-# Constants duplicated from scraper.py (kept here to avoid scraper's import-time
-# side effects from flag parsing). Keep in sync if scraper's lexicon changes.
-PRODUCT_HASHTAGS_PTS = {
-    "tiktokmademebuyit": 4, "tiktokshop": 4, "amazonfinds": 4,
-    "amazonmusthaves": 4, "founditonamazon": 4,
-    "productreview": 2, "musthaves": 2, "shophaul": 2, "unboxing": 2,
-    "shoppinghaul": 2, "affordablefinds": 2, "targetfinds": 2,
-    "shopwithme": 2, "amazondeal": 2, "amazondeals": 2,
-}
+# Word-boundary ad detection (does NOT match #advertisement)
+AD_RE = re.compile(
+    r"(?:^|[\s#])(?:ad|sponsored|paidpartnership|gifted|paid\s+partnership|"
+    r"sponsored\s+by)(?:[\s#:!.?,]|$)",
+    re.I,
+)
+
+# ---------------------------------------------------------------------------
+# Clustering constants - tight-scoped to avoid generic-CTA cluster pollution
+# ---------------------------------------------------------------------------
+
 SHOP_DOMAINS = ["amazon.", "shopify", "shopee", "tiktok.com/t/",
                 "linktr.ee", "beacons.ai", "stan.store", "allmylinks.com"]
-CLUSTER_KEYWORDS = {
-    "tiktokmademebuyit", "tiktokshop", "amazon find",
-    "available on amazon", "found on amazon",
-    "it's on amazon", "its on amazon",
-    "use code", "discount code", "promo code", "coupon code",
+
+# Hashtags that lump unrelated products under one bucket - excluded from
+# entity/tag clustering, only used for paid-content detection above.
+MEGA_CTA_TAGS = {
+    "tiktokmademebuyit", "tiktokshop", "amazonfinds", "amazonmusthaves",
+    "founditonamazon", "fyp", "fy", "foryou", "foryoupage", "viral",
+    "musthaves", "shophaul", "shoppinghaul", "haul", "ad", "sponsored",
+    "paidpartnership", "gifted", "ootd", "review", "unboxing",
+    "productreview", "shopwithme", "affordablefinds", "targetfinds",
+    "amazondeal", "amazondeals",
 }
+
+# Specific product-hashtag whitelist (carries enough product specificity to
+# cluster on, even though it doesn't decompose to noun tokens).
+SPECIFIC_HASHTAGS = set()  # could be populated from prior runs / Amazon BSR
+
+# Product nouns used by entity extraction and hashtag decomposition.
+PRODUCT_NOUNS = {
+    # beauty
+    "serum", "cream", "mask", "lipstick", "gloss", "balm", "lotion",
+    "cleanser", "moisturizer", "sunscreen", "spf", "perfume", "primer",
+    "concealer", "foundation", "blush", "mascara", "eyeliner", "eyeshadow",
+    "fragrance",
+    # gadget
+    "charger", "cable", "earbuds", "headphones", "lamp", "light", "speaker",
+    "tracker", "watch", "smartwatch", "camera", "drone",
+    # kitchen
+    "tumbler", "mug", "cup", "blender", "knife", "pan", "kettle", "mixer",
+    "spatula", "container", "organizer", "kettle",
+    # home
+    "candle", "diffuser", "rug", "pillow", "blanket", "curtain", "vase",
+    # apparel
+    "dress", "shirt", "tee", "jacket", "sneakers", "boots", "bag", "purse",
+    "leggings", "hoodie", "sweater",
+    # fitness
+    "weights", "dumbbell", "band", "mat",
+    # pet
+    "leash", "harness", "collar", "toy",
+}
+
+# Patterns for entity extraction
+CAPS_NOUN_PATTERN = (
+    r"\b([A-Z][\w'&-]+(?:\s+[A-Z][\w'&-]+){0,2})\s+("
+    + "|".join(re.escape(n) for n in PRODUCT_NOUNS)
+    + r")\b"
+)
+CAPS_NOUN_RE = re.compile(CAPS_NOUN_PATTERN)
+HASHTAG_RE_LOCAL = re.compile(r"#(\w+)")
+QUOTED_RE = re.compile(r"['\"]([^'\"]{3,40})['\"]")
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +266,70 @@ def parse_comments_raw(row):
         return [c for c in raw if c]
     if isinstance(raw, str) and raw:
         return [c.strip() for c in raw.split("|||") if c.strip()]
-    # fall back to intent samples if no full comments were saved
     samples = row.get("comment_intent_samples", "") or ""
     return [c.strip() for c in samples.split("||") if c.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Product entity extraction (rule-based NER)
+# ---------------------------------------------------------------------------
+
+def normalize_phrase(phrase):
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", phrase.lower())).strip()
+
+
+def split_hashtag(tag):
+    """Split a concatenated hashtag ('stanleycup' -> ['stanley', 'cup']).
+    Falls back to single-token list if wordninja isn't installed."""
+    if not WORDNINJA_OK:
+        return [tag]
+    try:
+        return wordninja.split(tag)
+    except Exception:
+        return [tag]
+
+
+def extract_product_phrases(row):
+    """Return a set of candidate product entity strings from one video.
+
+    Strategy:
+      1. 'Brand Noun' capitalized n-grams: 'Stanley tumbler', 'Drunk Elephant serum'
+      2. Hashtag decomposition: '#stanleycup' -> 'stanley cup' (must contain a noun)
+      3. Quoted strings adjacent to product nouns
+    """
+    caption = row.get("caption", "") or ""
+    out = set()
+
+    for m in CAPS_NOUN_RE.finditer(caption):
+        out.add(normalize_phrase(f"{m.group(1)} {m.group(2)}"))
+
+    for tag in HASHTAG_RE_LOCAL.findall(caption):
+        tl = tag.lower()
+        if tl in MEGA_CTA_TAGS:
+            continue
+        tokens = [t.lower() for t in split_hashtag(tl)]
+        if 2 <= len(tokens) <= 4 and any(t in PRODUCT_NOUNS for t in tokens):
+            out.add(normalize_phrase(" ".join(tokens)))
+
+    caption_l = caption.lower()
+    if any(n in caption_l for n in PRODUCT_NOUNS):
+        for q in QUOTED_RE.findall(caption):
+            ql = q.lower()
+            if any(n in ql for n in PRODUCT_NOUNS) and len(q.split()) <= 5:
+                out.add(normalize_phrase(q))
+
+    # Filter very short or pure-noun phrases (e.g. just 'serum' isn't a product)
+    out = {p for p in out if len(p.split()) >= 2 and len(p) <= 60}
+    return out
+
+
+def cross_validated_in_comments(phrase, comments_text_lower):
+    """Cluster cross-validation: the product phrase is mentioned in the
+    cluster's viewer comments (not just creator captions)."""
+    if not comments_text_lower:
+        return False
+    tokens = phrase.split()
+    return all(tok in comments_text_lower for tok in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -225,11 +350,11 @@ def enrich_video(row):
 
     engagement_pct = _pct(likes + n_comments * 2 + shares * 3 + saves * 4, views)
 
-    caption_l = (row.get("caption", "") or "").lower()
-    hashtags_l = (row.get("hashtags", "") or "").lower()
-    ad_markers = ["#ad", "#sponsored", "#paidpartnership", "#gifted",
-                  "paid partnership", "sponsored by"]
-    paid_flag = any(m in caption_l or m in hashtags_l for m in ad_markers)
+    caption = row.get("caption", "") or ""
+    hashtags_str = " ".join(
+        f"#{t.strip()}" for t in (row.get("hashtags", "") or "").split(",") if t.strip()
+    )
+    paid_flag = bool(AD_RE.search(caption)) or bool(AD_RE.search(hashtags_str))
     low_eng_warning = views >= 500_000 and engagement_pct < 1.5
 
     organic_mult = round(views / max(followers, 1), 2) if followers else 0
@@ -269,7 +394,7 @@ def enrich_video(row):
 
 
 # ---------------------------------------------------------------------------
-# Cluster grouping
+# Three-tier clustering
 # ---------------------------------------------------------------------------
 
 def canonicalize_link(link):
@@ -281,43 +406,103 @@ def canonicalize_link(link):
         return link.lower()
 
 
-def cluster_videos(rows):
-    """Group videos by shared product signal. Same logic as scraper but on enriched rows."""
-    clusters = {}
+def fuzzy_merge(buckets, threshold=88):
+    """Merge near-duplicate keys: 'stanley tumbler' + 'stanleys tumbler' -> one bucket.
+    No-op if rapidfuzz unavailable or only one bucket."""
+    if not FUZZY_OK or len(buckets) <= 1:
+        return dict(buckets)
+    keys = sorted(buckets.keys(), key=len)
+    canonical = {}
+    merged = defaultdict(list)
+    for k in keys:
+        target = None
+        for existing in set(canonical.values()):
+            if fuzz.token_set_ratio(k, existing) >= threshold:
+                target = existing
+                break
+        if target is None:
+            target = k
+        canonical[k] = target
+        merged[target].extend(buckets[k])
+    return dict(merged)
 
-    def add(key, row):
-        c = clusters.setdefault(key, {"signal": key, "videos": [], "creators": set()})
-        c["videos"].append(row)
-        c["creators"].add(row.get("author_username", ""))
+
+def cluster_videos(rows):
+    """Three-tier clustering. Returns list of cluster dicts:
+       {signal, tier, videos, creators, cross_validated}
+
+    Tiers (strongest to weakest):
+      'link'   - shared shop link (one URL = one product, almost certain)
+      'entity' - shared extracted product phrase ('stanley tumbler')
+      'tag'    - shared product-specific hashtag (not mega-CTA)
+    """
+    by_link = defaultdict(list)
+    by_entity = defaultdict(list)
+    by_tag = defaultdict(list)
 
     for r in rows:
-        for tag in (r.get("hashtags", "") or "").split(","):
-            t = tag.strip().lower()
-            if t and PRODUCT_HASHTAGS_PTS.get(t, 0) >= 3:
-                add(f"#{t}", r)
-        for link in (r.get("links", "") or "").split(","):
+        # Tier 1: canonicalized shop links
+        for link in (r.get("links") or "").split(","):
             link = link.strip()
             if not link:
                 continue
             host = urlparse(link).netloc.lower()
             if any(s in host for s in SHOP_DOMAINS):
-                add(canonicalize_link(link), r)
-        cap = (r.get("caption", "") or "").lower()
-        for kw in CLUSTER_KEYWORDS:
-            if kw in cap:
-                add(f"kw:{kw}", r)
+                by_link[canonicalize_link(link)].append(r)
+
+        # Tier 2: extracted product entities
+        for ent in extract_product_phrases(r):
+            by_entity[ent].append(r)
+
+        # Tier 3: product-specific hashtags (NOT mega-CTAs)
+        for tag in (r.get("hashtags") or "").split(","):
+            t = tag.strip().lower()
+            if not t or t in MEGA_CTA_TAGS or len(t) < 6:
+                continue
+            tokens = split_hashtag(t)
+            if (t in SPECIFIC_HASHTAGS
+                or (2 <= len(tokens) <= 4 and any(n in PRODUCT_NOUNS for n in tokens))):
+                by_tag[t].append(r)
+
+    by_entity = fuzzy_merge(by_entity, threshold=88)
 
     out = []
-    for c in clusters.values():
-        creators = {u for u in c["creators"] if u}
-        if len(creators) >= 2 and len(c["videos"]) >= 2:
-            c["creators"] = creators
+
+    def build(key, videos, tier):
+        creators = {v.get("author_username", "") for v in videos} - {""}
+        if len(creators) < 2 or len(videos) < 2:
+            return None
+        cross_val = False
+        if tier == "entity":
+            for v in videos:
+                comments_text = " ".join(parse_comments_raw(v)).lower()
+                if cross_validated_in_comments(key, comments_text):
+                    cross_val = True
+                    break
+        return {
+            "signal": key, "tier": tier,
+            "videos": videos, "creators": creators,
+            "cross_validated": cross_val,
+        }
+
+    for key, vids in by_link.items():
+        c = build(key, vids, "link")
+        if c:
             out.append(c)
+    for key, vids in by_entity.items():
+        c = build(key, vids, "entity")
+        if c:
+            out.append(c)
+    for key, vids in by_tag.items():
+        c = build(f"#{key}", vids, "tag")
+        if c:
+            out.append(c)
+
     return out
 
 
 # ---------------------------------------------------------------------------
-# Cluster-level business logic
+# Cluster-level helpers
 # ---------------------------------------------------------------------------
 
 def guess_category(text):
@@ -331,24 +516,55 @@ def guess_category(text):
 
 
 def guess_price_tier(text):
+    """Anchored price detection. Excludes 'off / discount / coupon' amounts and
+    prefers the maximum extracted price (product price, not the discount)."""
     text_l = text.lower()
+
+    # Collect discount amounts so we can exclude them from plain-$ fallback
+    discount_amounts = set()
+    for m in DISCOUNT_RE.finditer(text):
+        try:
+            discount_amounts.add(int(m.group(1)))
+        except (ValueError, IndexError):
+            pass
+
     prices = []
-    for rx in (PRICE_RE, UNDER_RE, PRICE_WORD_RE):
-        for m in rx.finditer(text):
+    # High-confidence: price context anchor word in front
+    for m in PRICE_ANCHORED_RE.finditer(text):
+        try:
+            prices.append(int(m.group(1)))
+        except (ValueError, IndexError):
+            pass
+    # Lower-confidence fallbacks only when nothing anchored
+    if not prices:
+        for m in PRICE_PLAIN_RE.finditer(text):
+            try:
+                val = int(m.group(1))
+                if val not in discount_amounts:
+                    prices.append(val)
+            except (ValueError, IndexError):
+                pass
+        for m in UNDER_RE.finditer(text):
             try:
                 prices.append(int(m.group(1)))
             except (ValueError, IndexError):
                 pass
+        for m in PRICE_WORD_RE.finditer(text):
+            try:
+                prices.append(int(m.group(1)))
+            except (ValueError, IndexError):
+                pass
+
     if prices:
-        prices.sort()
-        median = prices[len(prices) // 2]
-        if median <= 15:
-            return "under_15", f"~${median}"
-        if median <= 50:
-            return "15_50", f"~${median}"
-        if median <= 100:
-            return "50_100", f"~${median}"
-        return "100_plus", f"~${median}"
+        # Use the maximum: a video saying "$5 off the $30 serum" should report $30
+        product_price = max(prices)
+        if product_price <= 15:
+            return "under_15", f"~${product_price}"
+        if product_price <= 50:
+            return "15_50", f"~${product_price}"
+        if product_price <= 100:
+            return "50_100", f"~${product_price}"
+        return "100_plus", f"~${product_price}"
     if any(h in text_l for h in CHEAP_HINTS):
         return "under_15", "cheap_language"
     if any(h in text_l for h in PREMIUM_HINTS):
@@ -384,7 +600,7 @@ def saturation(n_creators):
 
 
 def score_cluster(cluster):
-    """Return (final_score_0_to_100, verdict, reasons[], concerns[])."""
+    """Return scoring dict with score, verdict, reasons, concerns."""
     videos = cluster["videos"]
     n_videos = len(videos)
     n_creators = len(cluster["creators"])
@@ -398,7 +614,7 @@ def score_cluster(cluster):
     total_neg = sum(v.get("sentiment_negative", 0) for v in videos)
     total_skep = sum(v.get("sentiment_skeptical", 0) for v in videos)
     total_questions = sum(v.get("sentiment_specific_questions", 0) for v in videos)
-    avg_engagement = (sum(v.get("engagement_pct", 0) for v in videos) / n_videos)
+    avg_engagement = sum(v.get("engagement_pct", 0) for v in videos) / n_videos
     avg_save_ratio = sum(v.get("save_ratio_pct", 0) for v in videos) / n_videos
     avg_velocity = sum(v.get("velocity_views_per_day", 0) for v in videos) / n_videos
     paid_count = sum(1 for v in videos if v.get("paid_content_flag"))
@@ -411,8 +627,10 @@ def score_cluster(cluster):
     category = guess_category(cluster_text)
     price_tier, price_evidence = guess_price_tier(cluster_text)
 
-    # ----- Scoring components (0-100 total) -----
-    # creator diversity (0-25): sweet spot 5-15 creators is best
+    tier = cluster.get("tier", "tag")
+    cross_validated = cluster.get("cross_validated", False)
+
+    # ----- Score components (0-100) -----
     if 5 <= n_creators <= 15:
         creator_pts = 25
     elif n_creators <= 4:
@@ -422,18 +640,17 @@ def score_cluster(cluster):
     else:
         creator_pts = max(5, 15 - (n_creators - 25) // 2)
 
-    # engagement quality (0-25): organic content runs 3-8%; >=5% is excellent
     eng_pts = min(25, avg_engagement * 5)
 
-    # demand signal (0-25): positive sentiment + buy-intent, minus negative/skeptical
-    raw_demand = total_buy_intent * 2 + total_pos + total_questions - total_neg * 2 - total_skep
+    raw_demand = (total_buy_intent * 2 + total_pos + total_questions
+                  - total_neg * 2 - total_skep)
     demand_pts = max(0, min(25, raw_demand))
 
-    # freshness (0-15)
+    # Fix: 'unknown' trajectory should not be rewarded
     freshness_pts = {"accelerating": 15, "fresh": 12, "mature": 7,
-                     "cooling": 3, "stale": 0, "unknown": 5}.get(traj, 5)
+                     "cooling": 3, "stale": 0, "unknown": 0}.get(traj, 0)
 
-    # sellability bonus (0-10): margin-friendly categories, micro-creator presence
+    # Sellability bonus / penalty
     sellability_pts = 0
     if category in BEST_MARGIN:
         sellability_pts += 4
@@ -445,12 +662,18 @@ def score_cluster(cluster):
         sellability_pts -= 2
     if micro_organic >= 2:
         sellability_pts += 3
-    sellability_pts = max(-5, min(10, sellability_pts))
+    # Fix: penalize suspicious low-engagement videos (-2 each)
+    sellability_pts -= 2 * low_eng_count
+    # Cluster-tier confidence bonus: link > entity > tag
+    sellability_pts += {"link": 5, "entity": 3, "tag": 0}.get(tier, 0)
+    if cross_validated:
+        sellability_pts += 3
+    sellability_pts = max(-10, min(15, sellability_pts))
 
     raw_score = creator_pts + eng_pts + demand_pts + freshness_pts + sellability_pts
     final_score = max(0, min(100, round(raw_score, 1)))
 
-    # ----- Verdict overrides -----
+    # ----- Verdict (with overrides) -----
     overrides = []
     if sat == "saturated":
         verdict = "SATURATED"
@@ -459,7 +682,6 @@ def score_cluster(cluster):
         verdict = "AVOID"
         overrides.append(f"More negative comments ({total_neg}) than positive ({total_pos})")
     elif paid_count / max(n_videos, 1) >= 0.5:
-        # majority of videos are explicit #ad - not organic
         verdict = "WATCH"
         overrides.append(f"{paid_count}/{n_videos} videos are paid - not organic demand")
     elif final_score >= 75:
@@ -473,6 +695,12 @@ def score_cluster(cluster):
 
     # ----- Reasoning -----
     reasons, concerns = [], []
+    if tier == "link":
+        reasons.append("clustered on shared shop link - same product confirmed")
+    elif tier == "entity":
+        reasons.append("clustered on extracted product entity (multiple creators name same product)")
+    if cross_validated:
+        reasons.append("product name appears in viewer comments (cross-validated)")
     if 5 <= n_creators <= 15:
         reasons.append(f"{n_creators} unrelated creators = real organic spread")
     if traj == "accelerating":
@@ -494,12 +722,16 @@ def score_cluster(cluster):
     if price_tier in ("under_15", "15_50") and price_evidence:
         reasons.append(f"price point {price_evidence} is in the dropship sweet spot")
 
+    if tier == "tag":
+        concerns.append("clustered only on hashtag - product identity not confirmed (could be mixed products)")
     if sat == "late":
         concerns.append(f"{n_creators} creators promoting - getting saturated")
     if traj == "cooling":
         concerns.append("trend is cooling (most videos >30 days old)")
     elif traj == "stale":
         concerns.append("trend is stale (median age >60 days)")
+    elif traj == "unknown":
+        concerns.append("no age data for videos - can't judge freshness")
     if total_neg >= 2:
         concerns.append(f"{total_neg} negative comments mentioning returns / broken / cheap quality")
     if total_skep >= 2:
@@ -518,8 +750,10 @@ def score_cluster(cluster):
     return {
         "score": final_score,
         "verdict": verdict,
-        "reasons": reasons[:5],
-        "concerns": concerns[:5],
+        "tier": tier,
+        "cross_validated": cross_validated,
+        "reasons": reasons[:6],
+        "concerns": concerns[:6],
         "overrides": overrides,
         "category": category,
         "price_tier": price_tier,
@@ -542,6 +776,7 @@ def score_cluster(cluster):
         "avg_velocity_per_day": round(avg_velocity, 1),
         "paid_video_count": paid_count,
         "micro_organic_count": micro_organic,
+        "low_engagement_count": low_eng_count,
     }
 
 
@@ -552,15 +787,15 @@ def score_cluster(cluster):
 def write_verdicts_csv(scored_clusters, path):
     if not scored_clusters:
         return
-    sample = scored_clusters[0]
     base_keys = [
-        "signal", "verdict", "score", "category", "price_tier", "price_evidence",
+        "signal", "tier", "cross_validated", "verdict", "score",
+        "category", "price_tier", "price_evidence",
         "saturation", "trajectory", "n_creators", "n_videos",
         "total_views", "total_likes", "total_shares", "total_saves",
         "total_buy_intent", "total_positive_sentiment", "total_negative_sentiment",
         "total_skeptical", "total_specific_questions",
         "avg_engagement_pct", "avg_save_ratio_pct", "avg_velocity_per_day",
-        "paid_video_count", "micro_organic_count",
+        "paid_video_count", "micro_organic_count", "low_engagement_count",
         "reasons", "concerns", "example_urls",
     ]
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -592,13 +827,31 @@ def write_report_md(scored_clusters, path, target):
             lines.append(f"- **{v}**: {len(by_verdict[v])}")
     lines.append("")
 
+    # Cluster-tier breakdown
+    by_tier = {}
+    for c in scored_clusters:
+        by_tier.setdefault(c.get("tier", "tag"), []).append(c)
+    if by_tier:
+        lines.append("**Cluster tiers:**")
+        for t in ("link", "entity", "tag"):
+            if t in by_tier:
+                lines.append(
+                    f"- `{t}`: {len(by_tier[t])} clusters"
+                    f"{' (strongest evidence)' if t == 'link' else ''}"
+                    f"{' (mid-confidence)' if t == 'entity' else ''}"
+                    f"{' (low-confidence, hashtag-only)' if t == 'tag' else ''}"
+                )
+        lines.append("")
+
     for v in order:
         if v not in by_verdict:
             continue
         lines.append(f"## {v}")
         lines.append("")
         for c in by_verdict[v]:
-            lines.append(f"### {c['signal']} — score {c['score']}")
+            tier_badge = f"`{c.get('tier','tag')}`"
+            cv_badge = " · ✓cross-validated" if c.get("cross_validated") else ""
+            lines.append(f"### {c['signal']} — score {c['score']} ({tier_badge}{cv_badge})")
             lines.append("")
             lines.append(
                 f"`{c['category']}` · price `{c['price_tier']}` "
@@ -657,6 +910,13 @@ def main():
         print(f"[!] File not found: {json_path}")
         sys.exit(1)
 
+    if not FUZZY_OK:
+        print("[!] rapidfuzz not installed - fuzzy entity merging disabled "
+              "('stanley tumbler' and 'stanleys tumbler' will stay separate)")
+    if not WORDNINJA_OK:
+        print("[!] wordninja not installed - concatenated hashtags ('#stanleycup') "
+              "won't be decomposed")
+
     rows = json.loads(json_path.read_text(encoding="utf-8"))
     print(f"[+] Loaded {len(rows)} videos from {json_path.name}")
 
@@ -691,10 +951,17 @@ def main():
     write_report_md(scored, report_path, target)
     print(f"[OK] Cluster verdicts -> {verdicts_path}")
     print(f"[OK] Human report   -> {report_path}")
+    by_tier = {}
+    for c in scored:
+        by_tier[c["tier"]] = by_tier.get(c["tier"], 0) + 1
+    tier_summary = ", ".join(f"{n} {t}" for t, n in by_tier.items())
+    print(f"[+] {len(scored)} clusters by tier: {tier_summary}")
     print("\nTop 5 candidates:")
     for c in scored[:5]:
-        print(f"  [{c['verdict']:<12}] {c['score']:>5.1f}  {c['signal']:<40}  "
-              f"{c['category']:<14} {c['n_creators']}c/{c['n_videos']}v "
+        cv = "✓" if c["cross_validated"] else " "
+        print(f"  [{c['verdict']:<12}] {c['score']:>5.1f} {cv} {c['tier']:<6} "
+              f"{c['signal']:<35} {c['category']:<14} "
+              f"{c['n_creators']}c/{c['n_videos']}v "
               f"{c['saturation']}/{c['trajectory']}")
 
 
